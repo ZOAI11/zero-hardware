@@ -231,7 +231,8 @@ def check_voice_toggle(text: str) -> Optional[str]:
     t = text.strip()
     if _VOICE_OFF_RE.search(t):
         return "off"
-    if len(t.split()) <= 4 and _VOICE_OFF_SHORT_RE.search(t):
+    words = t.split()
+    if len(words) <= 2 and _VOICE_OFF_SHORT_RE.search(t) and len(words) >= 1:
         return "off"
     if _VOICE_ON_RE.search(t):
         return "on"

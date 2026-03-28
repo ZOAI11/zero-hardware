@@ -79,14 +79,18 @@ VAD_MIN_SEC       = 0.3       # minimum utterance length to bother sending
 VAD_MAX_SEC       = 12.0      # hard cap — auto-flush at 12 seconds
 
 # #15 Local LLM fallback (Pi Zero 2W offline mode)
-# Download model:  mkdir -p ~/models
-#   wget -O ~/models/smollm2-360m-q4.gguf \
-#     https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_K_M.gguf
+# SmolLM2-135M-Q4: ~110MB file, ~150MB runtime RAM — fits Pi Zero 2W 512MB
+# Install model:
+#   mkdir -p ~/models
+#   wget -O ~/models/smollm2-135m-q4.gguf \
+#     "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+# Install llama-cpp-python (ARM, no GPU):
+#   pip install llama-cpp-python
 LOCAL_LLM_ENABLED   = True
-LOCAL_LLM_MODEL     = str(Path.home() / "models" / "smollm2-360m-q4.gguf")
+LOCAL_LLM_MODEL     = str(Path.home() / "models" / "smollm2-135m-q4.gguf")
 LOCAL_LLM_CTX       = 512          # context window (keep small for speed)
-LOCAL_LLM_THREADS   = 4            # Pi Zero 2W has 4 cores
-LOCAL_LLM_MAX_TOK   = 80           # max tokens per reply
+LOCAL_LLM_THREADS   = 2            # use only 2 threads to avoid OOM on 512MB
+LOCAL_LLM_MAX_TOK   = 60           # max tokens per reply (shorter = faster)
 # How many consecutive WS failures before switching to offline mode:
 OFFLINE_FAIL_THRESH = 3
 
@@ -174,9 +178,10 @@ def _try_load_local_llm() -> bool:
                     model_path=model_path,
                     n_ctx=LOCAL_LLM_CTX,
                     n_threads=LOCAL_LLM_THREADS,
+                    use_mmap=True,   # page weights from disk, saves peak RAM
                     verbose=False,
                 )
-                log.info("Local LLM: SmolLM2-360M loaded OK")
+                log.info("Local LLM: SmolLM2-135M loaded OK")
         return True
     except ImportError:
         log.warning("Local LLM: llama-cpp-python not installed (pip install llama-cpp-python)")

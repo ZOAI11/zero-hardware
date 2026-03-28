@@ -1,0 +1,16 @@
+# ZoarkBot Pi Zero Client — Python dependencies
+# Install with: pip3 install -r requirements.txt
+#
+# Note on I2S audio on Pi Zero W:
+#   sounddevice and pyaudio both use PortAudio.
+#   You may need to install PortAudio system library first:
+#     sudo apt-get install portaudio19-dev libportaudio2 libportaudiocpp0
+#   For I2S (INMP441 mic / MAX98357A speaker), configure ALSA
+#   to expose the I2S device as a PCM device (see MASTER_PLAN.md).
+
+pyserial==3.5
+websockets==12.0
+pyaudio==0.2.14
+sounddevice==0.4.6
+numpy==1.26.4
+openwakeword==0.4.0   # wake word detection ("hey zoark" via hey_jarvis model)

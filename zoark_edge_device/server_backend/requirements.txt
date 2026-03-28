@@ -1,0 +1,31 @@
+# ZoarkBot Edge Device — Server Backend
+# Install with: pip install -r requirements.txt
+#
+# Minimum Python: 3.11
+#
+# TTS note:
+#   gTTS requires internet access and produces MP3.
+#   Install pydub + ffmpeg for MP3→WAV conversion on the server:
+#     sudo apt-get install ffmpeg
+#     pip install pydub
+#   Or use ZOARK_TTS_ENGINE=pyttsx3 for offline TTS (requires espeak on Linux):
+#     sudo apt-get install espeak
+#     pip install pyttsx3
+
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+websockets==12.0
+numpy==1.26.4
+openai                # NVIDIA API (OpenAI-compatible)
+faster-whisper        # STT: Whisper tiny on CPU
+edge-tts              # Neural TTS (Microsoft, free, async)
+gtts==2.5.1           # gTTS fallback (optional)
+pydub==0.25.1         # MP3→WAV conversion (requires ffmpeg: apt install ffmpeg)
+
+# Optional — uncomment for offline TTS fallback
+# pyttsx3==2.90
+
+# Future — uncomment when wiring up real agents
+# langchain==0.2.6
+# crewai==0.36.0
+# openai-whisper==20231117

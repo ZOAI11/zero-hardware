@@ -1,0 +1,39 @@
+# Build artifacts
+zoark_edge_device/esp32_firmware/.pio/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+venv/
+env/
+.venv/
+
+# Screenshots / photos
+*.png
+*.jpg
+*.jpeg
+
+# Deploy / setup scripts (VPS credentials inside)
+deploy_server.py
+setup_pi.py
+setup_pi_bg.py
+setup_pi_done.py
+setup_pi_final.py
+setup_pi_finish.py
+setup_pi_resume.py
+fix_all.py
+fix_pi_client.py
+check_pi.py
+
+# Temp files
+corrected\ connections/
+*.tmp
+*.log

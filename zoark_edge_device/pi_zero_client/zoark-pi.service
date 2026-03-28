@@ -1,0 +1,16 @@
+[Unit]
+Description=ZoarkBot Pi Zero Edge Client
+After=network.target sound.target
+
+[Service]
+Type=simple
+User=zero
+WorkingDirectory=/home/zero/pi_zero_client
+ExecStart=/home/zero/zoark-env/bin/python /home/zero/pi_zero_client/pi_main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

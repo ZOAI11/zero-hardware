@@ -168,17 +168,24 @@ _UNCERTAIN_RE = re.compile(
     r"i can.t confirm|i.m unable to confirm)\b",
     re.IGNORECASE,
 )
-_VOICE_OFF_RE = re.compile(
-    r"\b(stop|be quiet|shut up|go quiet|go to sleep|sleep mode|"
-    r"mute|silence|stop (talking|responding|listening)|quiet(ly)?|"
-    r"take a break|pause|shush|shh+)\b",
+# Mute: explicit phrases always fire; short ambiguous words only if utterance <= 4 words
+_VOICE_OFF_EXPLICIT = re.compile(
+    r"(be quiet|shut up|go quiet|go to sleep|sleep mode|stop talking|"
+    r"stop (responding|listening)|take a break|shush|shh+|"
+    r"zero[\s,]+(stop|be quiet|shut up|go quiet|go to sleep|sleep|mute|silence|quiet))",
     re.IGNORECASE,
 )
+_VOICE_OFF_SHORT = re.compile(   # only fires when transcript is <= 4 words
+    r"(stop|pause|quiet|mute|silence|sleep)",
+    re.IGNORECASE,
+)
+# Unmute: "wake up", "wakeup", "zero wakeup", "zero wake up", "hey zero", etc.
 _VOICE_ON_RE = re.compile(
-    r"\b(wake up|start (talking|responding|listening)|come back|"
+    r"(wake\s*up|wakeup|start (talking|responding|listening)|come back|"
     r"unmute|talk (again|to me)|respond( again)?|"
-    r"i need you|hey zero|zero (respond|listen|wake)|"
-    r"you can (talk|speak|respond) (now|again)|turn on)\b",
+    r"i need you|hey zero|"
+    r"zero[\s,]+(respond|listen|wake\s*up|wakeup|start|come back)|"
+    r"you can (talk|speak|respond) (now|again)|turn on)",
     re.IGNORECASE,
 )
 
@@ -201,8 +208,19 @@ def detect_emotion(text: str) -> str:
     return "speak_anim"
 
 def check_voice_toggle(text: str) -> Optional[str]:
-    if _VOICE_OFF_RE.search(text): return "off"
-    if _VOICE_ON_RE.search(text):  return "on"
+    """
+    Mute/unmute intent detection.
+    - Explicit multi-word OFF phrases always trigger.
+    - Short words (stop/quiet/pause) only trigger on <= 4-word utterances.
+    - When muted: Zero still transcribes to catch wake phrases (listening mode).
+    """
+    t = text.strip()
+    if _VOICE_OFF_EXPLICIT.search(t):
+        return "off"
+    if len(t.split()) <= 4 and _VOICE_OFF_SHORT.search(t):
+        return "off"
+    if _VOICE_ON_RE.search(t):
+        return "on"
     return None
 
 # ── Name / fact extraction prompt ────────────────────────────

@@ -1,14 +1,16 @@
 """
 ============================================================
- Zero Edge Device — Server Backend v5
+ Zero Edge Device — Server Backend v6
  FastAPI + WebSocket + Whisper STT + NVIDIA LLM + edge-tts
  Features:
    - Streaming TTS (sentence-by-sentence, ~half latency)
    - Persistent memory (facts + history per device)
-   - Whisper medium (better accuracy)
+   - Whisper tiny (fast, free)
    - DuckDuckGo web search for unknown questions
    - Voice toggle (say "stop" / "wake up")
    - GET /toggle, GET /status
+   - #13 Voice emotion detection (pitch + energy + ZCR)
+   - #20 Live web dashboard with SSE event stream
 ============================================================
 """
 
@@ -26,9 +28,9 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from openai import AsyncOpenAI
 
 # ── Logging ─────────────────────────────────────────────────
@@ -39,7 +41,7 @@ logging.basicConfig(
 log = logging.getLogger("zero-server")
 
 # ── FastAPI ──────────────────────────────────────────────────
-app = FastAPI(title="Zero Edge Server v5")
+app = FastAPI(title="Zero Edge Server v6")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
@@ -71,7 +73,7 @@ NVIDIA_MODEL    = "meta/llama-3.1-8b-instruct"
 _llm = AsyncOpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL)
 log.info("LLM: NVIDIA API (%s)", NVIDIA_MODEL)
 
-# ── Whisper STT (medium for better accuracy) ──────────────────
+# ── Whisper STT ───────────────────────────────────────────────
 _whisper_model = None
 try:
     from faster_whisper import WhisperModel
@@ -155,6 +157,9 @@ Rules:
   - React to being upside down playfully
   - When you used web search, say "I looked that up!" naturally
   - If you learn the user's name or a personal fact, use it naturally in replies
+  - If the user sounds happy (voice_emotion=happy), be extra cheerful
+  - If the user sounds sad (voice_emotion=sad), be warm and comforting
+  - If the user sounds angry (voice_emotion=angry), be calm and understanding
 """
 
 def build_system_prompt(ip: str) -> str:
@@ -223,12 +228,6 @@ def detect_emotion(text: str) -> str:
     return "speak_anim"
 
 def check_voice_toggle(text: str) -> Optional[str]:
-    """
-    Mute/unmute intent detection.
-    - Explicit multi-word OFF phrases always trigger.
-    - Short words (stop/quiet/pause) only trigger on <= 4-word utterances.
-    - When muted: Zero still transcribes to catch wake phrases (listening mode).
-    """
     t = text.strip()
     if _VOICE_OFF_RE.search(t):
         return "off"
@@ -237,6 +236,385 @@ def check_voice_toggle(text: str) -> Optional[str]:
     if _VOICE_ON_RE.search(t):
         return "on"
     return None
+
+# ── #13 Voice Emotion Detection ───────────────────────────────
+def detect_voice_emotion(wav_bytes: bytes) -> str:
+    """
+    Analyze audio signal to detect user's emotional state.
+    Uses pitch (autocorrelation), RMS energy, and zero-crossing rate.
+    Returns: 'happy', 'angry', 'sad', or 'neutral'
+    """
+    try:
+        buf = io.BytesIO(wav_bytes)
+        with wave.open(buf, "rb") as wf:
+            sr        = wf.getframerate()
+            n_frames  = wf.getnframes()
+            n_ch      = wf.getnchannels()
+            sampw     = wf.getsampwidth()
+            raw       = wf.readframes(n_frames)
+
+        # Decode samples
+        if sampw == 2:
+            pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sampw == 4:
+            pcm = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            return "neutral"
+
+        # Take mono (left channel if stereo)
+        if n_ch > 1:
+            pcm = pcm[::n_ch]
+
+        if len(pcm) < sr // 10:  # < 100ms — too short to analyze
+            return "neutral"
+
+        # ── Energy (RMS) ─────────────────────────────────────
+        rms       = float(np.sqrt(np.mean(pcm ** 2)) + 1e-9)
+        energy_db = 20.0 * np.log10(rms)
+
+        # ── Zero-crossing rate ────────────────────────────────
+        zcr = float(np.mean(np.abs(np.diff(np.sign(pcm)))) / 2.0)
+
+        # ── Pitch (autocorrelation on first second max) ───────
+        analysis_samples = min(len(pcm), sr)
+        seg    = pcm[:analysis_samples]
+        min_lag = max(1, sr // 400)  # 400 Hz upper bound
+        max_lag = sr // 80           # 80 Hz lower bound
+        corr   = np.correlate(seg, seg, mode="full")
+        corr   = corr[len(corr) // 2:]
+        pitch_hz = 0.0
+        if max_lag < len(corr) and max_lag > min_lag:
+            peak_offset = int(np.argmax(corr[min_lag:max_lag]))
+            peak_lag    = peak_offset + min_lag
+            if peak_lag > 0:
+                pitch_hz = float(sr) / peak_lag
+
+        log.debug(
+            "VoiceEmotion: energy=%.1f dB  pitch=%.0f Hz  zcr=%.3f",
+            energy_db, pitch_hz, zcr,
+        )
+
+        # ── Mapping heuristics ────────────────────────────────
+        # High energy + high pitch → excited / happy
+        if energy_db > -22.0 and pitch_hz > 210:
+            return "happy"
+        # High energy + low-mid pitch + low ZCR → angry / assertive
+        if energy_db > -20.0 and pitch_hz < 185 and zcr < 0.12:
+            return "angry"
+        # Low energy, low pitch, or both → sad / quiet
+        if energy_db < -34.0 or (pitch_hz < 145 and energy_db < -28.0):
+            return "sad"
+        return "neutral"
+
+    except Exception as exc:
+        log.debug("detect_voice_emotion error: %s", exc)
+        return "neutral"
+
+# ── #20 SSE Event Bus ─────────────────────────────────────────
+# Each subscriber is an asyncio.Queue fed by _broadcast_event().
+_sse_subscribers: list[asyncio.Queue] = []
+
+async def _broadcast_event(event: dict) -> None:
+    """Push an event to all active SSE subscribers (non-blocking)."""
+    dead: list[asyncio.Queue] = []
+    for q in _sse_subscribers:
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            dead.append(q)
+    for q in dead:
+        try:
+            _sse_subscribers.remove(q)
+        except ValueError:
+            pass
+
+# ── #20 Dashboard HTML ────────────────────────────────────────
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zero · Live Dashboard</title>
+<style>
+  :root {
+    --bg: #0d0d1a; --card: #13132a; --border: #252545;
+    --accent: #7c6af5; --accent2: #4de8c2; --text: #e8e8f5;
+    --muted: #6a6a8a; --user: #2a4a8a; --zero: #1a3a2a;
+    --angry: #c0392b; --happy: #f39c12; --sad: #2980b9; --neutral: #7c6af5;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif;
+         height: 100vh; display: flex; flex-direction: column; }
+  header { background: var(--card); border-bottom: 1px solid var(--border);
+           padding: 14px 24px; display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+  .logo { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.5px;
+          background: linear-gradient(135deg, var(--accent), var(--accent2));
+          -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #555;
+                transition: background 0.4s; flex-shrink: 0; }
+  .status-dot.live { background: #2ecc71; box-shadow: 0 0 8px #2ecc71; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+  .status-label { font-size: 0.8rem; color: var(--muted); }
+  .mute-badge { margin-left: auto; font-size: 0.75rem; padding: 4px 10px; border-radius: 12px;
+                background: #333; color: var(--muted); transition: all 0.3s; }
+  .mute-badge.muted { background: #4a1a1a; color: #e74c3c; }
+  .main { display: flex; flex: 1; overflow: hidden; gap: 0; }
+  .chat-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--border); }
+  .chat-header { padding: 12px 20px; border-bottom: 1px solid var(--border);
+                 font-size: 0.8rem; color: var(--muted); letter-spacing: 0.5px; text-transform: uppercase; flex-shrink: 0; }
+  .chat-feed { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .chat-feed::-webkit-scrollbar { width: 4px; }
+  .chat-feed::-webkit-scrollbar-track { background: transparent; }
+  .chat-feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .msg { max-width: 80%; padding: 10px 14px; border-radius: 14px; font-size: 0.9rem;
+         line-height: 1.45; animation: fadeIn 0.25s ease; }
+  @keyframes fadeIn { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform:none; } }
+  .msg.user { background: var(--user); border-bottom-right-radius: 4px; align-self: flex-end;
+              border: 1px solid rgba(124,106,245,0.2); }
+  .msg.zero { background: var(--zero); border-bottom-left-radius: 4px; align-self: flex-start;
+              border: 1px solid rgba(77,232,194,0.15); }
+  .msg .sender { font-size: 0.7rem; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .msg .emo-tag { display: inline-block; margin-left: 6px; font-size: 0.7rem;
+                  padding: 1px 6px; border-radius: 8px; vertical-align: middle; }
+  .side-panel { width: 280px; display: flex; flex-direction: column; gap: 0; flex-shrink: 0; }
+  .side-section { border-bottom: 1px solid var(--border); padding: 16px; }
+  .side-title { font-size: 0.7rem; color: var(--muted); text-transform: uppercase;
+                letter-spacing: 0.5px; margin-bottom: 12px; }
+  .emotion-display { text-align: center; padding: 8px 0; }
+  .emotion-icon { font-size: 3rem; display: block; line-height: 1; margin-bottom: 8px;
+                  transition: all 0.4s; filter: drop-shadow(0 0 12px currentColor); }
+  .emotion-name { font-size: 1rem; font-weight: 600; transition: color 0.4s; }
+  .emotion-name.happy { color: var(--happy); }
+  .emotion-name.angry { color: var(--angry); }
+  .emotion-name.sad   { color: var(--sad); }
+  .emotion-name.neutral { color: var(--neutral); }
+  .emotion-bars { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+  .emo-bar-row { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; color: var(--muted); }
+  .emo-bar-label { width: 50px; text-align: right; }
+  .emo-bar-track { flex: 1; height: 6px; background: rgba(255,255,255,0.05); border-radius: 3px; overflow: hidden; }
+  .emo-bar-fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; width: 0%; }
+  .emo-bar-fill.happy  { background: var(--happy); }
+  .emo-bar-fill.angry  { background: var(--angry); }
+  .emo-bar-fill.sad    { background: var(--sad); }
+  .emo-bar-fill.neutral { background: var(--neutral); }
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+               border-radius: 8px; padding: 10px; text-align: center; }
+  .stat-val { font-size: 1.2rem; font-weight: 700; color: var(--accent2); }
+  .stat-key { font-size: 0.65rem; color: var(--muted); margin-top: 2px; text-transform: uppercase; }
+  .waveform { display: flex; align-items: flex-end; justify-content: center;
+              gap: 3px; height: 40px; margin-top: 4px; }
+  .wave-bar { width: 4px; background: var(--accent); border-radius: 2px; min-height: 3px;
+              transition: height 0.1s; opacity: 0.7; }
+  .conn-log { font-size: 0.72rem; color: var(--muted); font-family: 'Courier New', monospace;
+              max-height: 80px; overflow-y: auto; line-height: 1.6; }
+  .conn-log .log-line { color: #5a9; }
+  .conn-log .log-line.warn { color: #e67; }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">&#9675; Zero</span>
+  <span class="status-dot" id="dot"></span>
+  <span class="status-label" id="status-label">Connecting…</span>
+  <span class="mute-badge" id="mute-badge">ACTIVE</span>
+</header>
+<div class="main">
+  <div class="chat-panel">
+    <div class="chat-header">Live Conversation</div>
+    <div class="chat-feed" id="feed">
+      <div style="color:var(--muted);font-size:0.82rem;text-align:center;margin-top:20px">
+        Waiting for Zero to speak…
+      </div>
+    </div>
+  </div>
+  <div class="side-panel">
+    <div class="side-section">
+      <div class="side-title">Emotion</div>
+      <div class="emotion-display">
+        <span class="emotion-icon" id="emo-icon">😐</span>
+        <div class="emotion-name neutral" id="emo-name">neutral</div>
+      </div>
+      <div class="emotion-bars">
+        <div class="emo-bar-row"><span class="emo-bar-label">happy</span>
+          <div class="emo-bar-track"><div class="emo-bar-fill happy" id="bar-happy"></div></div></div>
+        <div class="emo-bar-row"><span class="emo-bar-label">angry</span>
+          <div class="emo-bar-track"><div class="emo-bar-fill angry" id="bar-angry"></div></div></div>
+        <div class="emo-bar-row"><span class="emo-bar-label">sad</span>
+          <div class="emo-bar-track"><div class="emo-bar-fill sad" id="bar-sad"></div></div></div>
+        <div class="emo-bar-row"><span class="emo-bar-label">neutral</span>
+          <div class="emo-bar-track"><div class="emo-bar-fill neutral" id="bar-neutral"></div></div></div>
+      </div>
+    </div>
+    <div class="side-section">
+      <div class="side-title">Audio Activity</div>
+      <div class="waveform" id="wave">
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+        <div class="wave-bar" style="height:3px"></div>
+      </div>
+    </div>
+    <div class="side-section">
+      <div class="side-title">Session Stats</div>
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-val" id="stat-turns">0</div><div class="stat-key">Turns</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-clients">0</div><div class="stat-key">Clients</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-emo">😐</div><div class="stat-key">Mood</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-muted">🔊</div><div class="stat-key">State</div></div>
+      </div>
+    </div>
+    <div class="side-section" style="flex:1">
+      <div class="side-title">Log</div>
+      <div class="conn-log" id="conn-log"></div>
+    </div>
+  </div>
+</div>
+<script>
+const EMO_ICONS = {happy:'😄', angry:'😠', sad:'😢', neutral:'😐', speak_anim:'🗣️'};
+const EMO_COLORS = {happy:'#f39c12', angry:'#c0392b', sad:'#2980b9', neutral:'#7c6af5'};
+let turns = 0, currentEmo = 'neutral', waveTimer = null;
+
+function addLog(msg, warn=false) {
+  const el = document.getElementById('conn-log');
+  const line = document.createElement('div');
+  line.className = 'log-line' + (warn ? ' warn' : '');
+  line.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+  while (el.children.length > 30) el.removeChild(el.firstChild);
+}
+
+function setEmotion(emo) {
+  const raw = emo === 'speak_anim' ? 'neutral' : emo;
+  currentEmo = raw;
+  document.getElementById('emo-icon').textContent = EMO_ICONS[raw] || '😐';
+  const nameEl = document.getElementById('emo-name');
+  nameEl.textContent = raw;
+  nameEl.className = 'emotion-name ' + raw;
+  document.getElementById('stat-emo').textContent = EMO_ICONS[raw] || '😐';
+  const bars = {happy:0, angry:0, sad:0, neutral:0};
+  bars[raw] = 100;
+  // add secondary bar for context
+  if (raw === 'happy')   bars.neutral = 20;
+  if (raw === 'angry')   bars.neutral = 15;
+  if (raw === 'sad')     bars.neutral = 25;
+  if (raw === 'neutral') { bars.happy = 15; bars.sad = 10; }
+  ['happy','angry','sad','neutral'].forEach(e => {
+    const b = document.getElementById('bar-' + e);
+    if (b) b.style.width = bars[e] + '%';
+  });
+}
+
+function animateWave(active) {
+  clearInterval(waveTimer);
+  const bars = document.querySelectorAll('.wave-bar');
+  if (!active) {
+    bars.forEach(b => b.style.height = '3px');
+    return;
+  }
+  waveTimer = setInterval(() => {
+    bars.forEach(b => {
+      const h = active ? (3 + Math.random() * 34) : 3;
+      b.style.height = h + 'px';
+    });
+  }, 80);
+}
+
+function addMessage(role, text, emo) {
+  const feed = document.getElementById('feed');
+  // Remove placeholder
+  const ph = feed.querySelector('div[style]');
+  if (ph) ph.remove();
+
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + role;
+  const sender = document.createElement('div');
+  sender.className = 'sender';
+  sender.textContent = role === 'user' ? 'You' : 'Zero';
+  if (emo && emo !== 'speak_anim') {
+    const tag = document.createElement('span');
+    tag.className = 'emo-tag';
+    tag.style.background = EMO_COLORS[emo] + '33';
+    tag.style.color = EMO_COLORS[emo];
+    tag.textContent = EMO_ICONS[emo] + ' ' + emo;
+    sender.appendChild(tag);
+  }
+  const body = document.createElement('div');
+  body.textContent = text;
+  wrap.appendChild(sender);
+  wrap.appendChild(body);
+  feed.appendChild(wrap);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function connect() {
+  const es = new EventSource('/events');
+  document.getElementById('dot').className = 'status-dot';
+  document.getElementById('status-label').textContent = 'Connecting…';
+
+  es.onopen = () => {
+    document.getElementById('dot').className = 'status-dot live';
+    document.getElementById('status-label').textContent = 'Live';
+    addLog('Connected to Zero server');
+  };
+
+  es.onerror = () => {
+    document.getElementById('dot').className = 'status-dot';
+    document.getElementById('status-label').textContent = 'Reconnecting…';
+    addLog('Connection lost — retrying…', true);
+    setTimeout(connect, 3000);
+    es.close();
+  };
+
+  es.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.type === 'ping') return;
+
+    if (ev.type === 'user_heard') {
+      turns++;
+      document.getElementById('stat-turns').textContent = turns;
+      if (ev.voice_emotion) setEmotion(ev.voice_emotion);
+      addMessage('user', ev.text, ev.voice_emotion);
+      animateWave(true);
+      addLog('User: ' + ev.text.substring(0, 60));
+    }
+
+    if (ev.type === 'zero_chunk') {
+      if (ev.text) addMessage('zero', ev.text, ev.ui);
+      if (ev.ui) setEmotion(ev.ui);
+      animateWave(false);
+      if (ev.text) addLog('Zero: ' + ev.text.substring(0, 60));
+    }
+
+    if (ev.type === 'mute_change') {
+      const muted = ev.muted;
+      const badge = document.getElementById('mute-badge');
+      badge.textContent = muted ? 'MUTED' : 'ACTIVE';
+      badge.className = 'mute-badge' + (muted ? ' muted' : '');
+      document.getElementById('stat-muted').textContent = muted ? '🔇' : '🔊';
+      addLog(muted ? 'Zero muted' : 'Zero unmuted');
+    }
+
+    if (ev.type === 'client_count') {
+      document.getElementById('stat-clients').textContent = ev.count;
+    }
+  };
+}
+
+connect();
+</script>
+</body>
+</html>"""
 
 # ── Name / fact extraction prompt ────────────────────────────
 _EXTRACT_PROMPT = (
@@ -370,6 +748,7 @@ async def stream_reply(
     user_text: str,
     context: dict,
     ip: str,
+    voice_emotion: str = "neutral",
 ) -> str:
     """
     Stream LLM response sentence by sentence.
@@ -383,6 +762,9 @@ async def stream_reply(
     ctx_note = ""
     if motion == "shaking":   ctx_note = " [Zero is being shaken!]"
     elif orient == "down":    ctx_note = " [Zero is upside down!]"
+    # Inject voice emotion so LLM can tailor its response tone
+    if voice_emotion and voice_emotion != "neutral":
+        ctx_note += f" [voice_emotion={voice_emotion}]"
 
     messages = (
         [{"role": "system", "content": build_system_prompt(ip)}]
@@ -423,15 +805,23 @@ async def stream_reply(
                     if not sentence:
                         continue
                     wav = await tts_sentence(sentence)
-                    ui  = detect_emotion(sentence) if first_chunk else None
+                    ui  = detect_emotion(sentence) if first_chunk else "speak_anim"
                     first_chunk = False
-                    await websocket.send_json({
+                    payload = {
                         "type":        "audio_chunk",
                         "audio_b64":   base64.b64encode(wav).decode(),
-                        "ui":          ui or "speak_anim",
+                        "ui":          ui,
                         "text":        sentence,
                         "chunk_index": chunk_index,
                         "is_last":     False,
+                    }
+                    await websocket.send_json(payload)
+                    # Broadcast to dashboard
+                    await _broadcast_event({
+                        "type": "zero_chunk",
+                        "text": sentence,
+                        "ui":   ui,
+                        "chunk_index": chunk_index,
                     })
                     chunk_index += 1
                     log.info("Chunk %d sent: %r", chunk_index, sentence[:50])
@@ -440,14 +830,16 @@ async def stream_reply(
         remaining = token_buf.strip()
         if remaining:
             wav = await tts_sentence(remaining)
+            ui = detect_emotion(remaining)
             await websocket.send_json({
                 "type":        "audio_chunk",
                 "audio_b64":   base64.b64encode(wav).decode(),
-                "ui":          "speak_anim",
+                "ui":          ui,
                 "text":        remaining,
                 "chunk_index": chunk_index,
                 "is_last":     True,
             })
+            await _broadcast_event({"type": "zero_chunk", "text": remaining, "ui": ui})
         else:
             await websocket.send_json({
                 "type": "audio_chunk", "audio_b64": "",
@@ -464,6 +856,7 @@ async def stream_reply(
             "ui": "speak_anim", "text": fallback,
             "chunk_index": 0, "is_last": True,
         })
+        await _broadcast_event({"type": "zero_chunk", "text": fallback, "ui": "speak_anim"})
         full_reply = fallback
 
     # Check uncertainty in full reply -> search and add follow-up
@@ -497,11 +890,17 @@ async def stream_reply(
                         "ui": "happy", "text": followup,
                         "chunk_index": chunk_index + 1, "is_last": True,
                     })
+                    await _broadcast_event({"type": "zero_chunk", "text": followup, "ui": "happy"})
                     full_reply += " " + followup
             except Exception as e:
                 log.error("Search follow-up error: %s", e)
 
     return full_reply.strip()
+
+# ─────────────────────────────────────────────────────────────
+#  ACTIVE CLIENT TRACKING
+# ─────────────────────────────────────────────────────────────
+_active_clients: set[str] = set()
 
 # ─────────────────────────────────────────────────────────────
 #  TOGGLE ENDPOINTS
@@ -514,6 +913,7 @@ async def toggle_response() -> JSONResponse:
     _save_mute_state(not response_enabled)
     state = "ON" if response_enabled else "OFF"
     log.info("Response toggled: %s", state)
+    await _broadcast_event({"type": "mute_change", "muted": not response_enabled})
     return JSONResponse({"response_enabled": response_enabled, "state": state})
 
 
@@ -532,10 +932,68 @@ async def get_status() -> JSONResponse:
     })
 
 
+@app.get("/health")
+async def health() -> dict:
+    tts = "edge-tts" if _edge_tts_ok else ("gtts" if _gtts_cls else "silent")
+    return {
+        "status": "ok",
+        "response_enabled": response_enabled,
+        "stt":    "faster-whisper-tiny" if _whisper_model else "disabled",
+        "llm":    NVIDIA_MODEL,
+        "tts":    tts,
+        "search": "duckduckgo" if _ddgs_ok else "disabled",
+        "streaming": True,
+    }
+
+
 @app.get("/memory/{ip}")
 async def get_memory(ip: str) -> JSONResponse:
     mem = get_device_mem(ip.replace("-", "."))
     return JSONResponse({"ip": ip, "name": mem["name"], "facts": mem["facts"]})
+
+# ─────────────────────────────────────────────────────────────
+#  #20 DASHBOARD + SSE ENDPOINTS
+# ─────────────────────────────────────────────────────────────
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> HTMLResponse:
+    return HTMLResponse(_DASHBOARD_HTML)
+
+
+@app.get("/events")
+async def sse_events(request: Request) -> StreamingResponse:
+    """Server-Sent Events stream for the live dashboard."""
+    q: asyncio.Queue = asyncio.Queue(maxsize=50)
+    _sse_subscribers.append(q)
+
+    async def generator():
+        try:
+            # Send current state immediately on connect
+            yield f"data: {json.dumps({'type': 'mute_change', 'muted': not response_enabled})}\n\n"
+            yield f"data: {json.dumps({'type': 'client_count', 'count': len(_active_clients)})}\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=25.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    # Keepalive ping so the connection doesn't drop
+                    yield "data: {\"type\":\"ping\"}\n\n"
+                except asyncio.CancelledError:
+                    break
+        finally:
+            try:
+                _sse_subscribers.remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+        },
+    )
 
 # ─────────────────────────────────────────────────────────────
 #  WEBSOCKET
@@ -548,6 +1006,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     global response_enabled
     client_ip = websocket.client.host if websocket.client else "unknown"
     await websocket.accept()
+    _active_clients.add(client_ip)
+    await _broadcast_event({"type": "client_count", "count": len(_active_clients)})
     mem = get_device_mem(client_ip)
     log.info("WebSocket connected from %s (known: %s)", client_ip, mem.get("name") or "stranger")
 
@@ -574,16 +1034,28 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             audio_bytes = base64.b64decode(audio_b64)
             loop        = asyncio.get_running_loop()
 
+            # ── #13 Voice emotion analysis (non-blocking) ─────
+            voice_emotion = await loop.run_in_executor(
+                None, detect_voice_emotion, audio_bytes
+            )
+            log.info("Voice emotion: %s", voice_emotion)
+
             # ── STT ──────────────────────────────────────────
             user_text = await loop.run_in_executor(None, transcribe_audio, audio_bytes)
             if not user_text:
                 log.info("STT empty — skipping")
                 continue
             # Whisper sometimes transcribes "zero" as digit "0" — normalise it
-            user_text = re.sub(r"0", "zero", user_text)
+            user_text = re.sub(r"\b0\b", "zero", user_text)
             log.info("User said: %r", user_text)
 
-            # ── Voice toggle ──────────────────────────────────
+            # Broadcast user utterance to dashboard
+            await _broadcast_event({
+                "type":         "user_heard",
+                "text":         user_text,
+                "voice_emotion": voice_emotion,
+            })
+
             # ── Voice toggle ──────────────────────────────────
             voice_cmd = check_voice_toggle(user_text)
             log.info("Toggle: cmd=%r enabled=%r", voice_cmd, response_enabled)
@@ -591,6 +1063,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 response_enabled = False
                 _save_mute_state(True)
                 log.info("MUTED: Zero going quiet")
+                await _broadcast_event({"type": "mute_change", "muted": True})
                 reply = "Okay, going quiet! Just say wake up whenever you need me!"
                 wav   = await tts_sentence(reply)
                 await websocket.send_json({
@@ -599,11 +1072,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "ui": "sad", "text": reply,
                     "chunk_index": 0, "is_last": True,
                 })
+                await _broadcast_event({"type": "zero_chunk", "text": reply, "ui": "sad"})
                 continue
             elif voice_cmd == "on" and not response_enabled:
                 response_enabled = True
                 _save_mute_state(False)
                 log.info("UNMUTED: Zero waking up")
+                await _broadcast_event({"type": "mute_change", "muted": False})
                 reply = "Zero is back! So happy to talk to you again!"
                 wav   = await tts_sentence(reply)
                 await websocket.send_json({
@@ -612,19 +1087,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "ui": "happy", "text": reply,
                     "chunk_index": 0, "is_last": True,
                 })
+                await _broadcast_event({"type": "zero_chunk", "text": reply, "ui": "happy"})
                 continue
 
             if not response_enabled:
                 log.info("SILENT (muted) — ignoring: %r", user_text[:50])
                 continue
 
-
             # ── Extract and store personal facts (async, non-blocking) ─
             asyncio.create_task(_update_memory(client_ip, user_text))
 
             # ── Stream LLM + TTS ─────────────────────────────
             history    = mem.get("history", [])
-            full_reply = await stream_reply(websocket, history, user_text, context, client_ip)
+            full_reply = await stream_reply(
+                websocket, history, user_text, context, client_ip,
+                voice_emotion=voice_emotion,
+            )
 
             # Update history
             history.append({"role": "user",      "content": user_text})
@@ -637,6 +1115,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception as e:
         log.exception("WebSocket error: %s", e)
     finally:
+        _active_clients.discard(client_ip)
+        await _broadcast_event({"type": "client_count", "count": len(_active_clients)})
         log.info("WebSocket closed for %s", client_ip)
 
 
@@ -659,17 +1139,3 @@ async def _update_memory(ip: str, user_text: str) -> None:
             save_device_mem(ip)
     except Exception as e:
         log.debug("Memory update error: %s", e)
-
-
-@app.get("/health")
-async def health() -> dict:
-    tts = "edge-tts" if _edge_tts_ok else ("gtts" if _gtts_cls else "silent")
-    return {
-        "status": "ok",
-        "response_enabled": response_enabled,
-        "stt":    "faster-whisper-tiny" if _whisper_model else "disabled",
-        "llm":    NVIDIA_MODEL,
-        "tts":    tts,
-        "search": "duckduckgo" if _ddgs_ok else "disabled",
-        "streaming": True,
-    }

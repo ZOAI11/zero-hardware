@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 import wave
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -76,6 +77,18 @@ VAD_THRESHOLD_DB  = -30.0     # dB after gain — louder than this = voice
 VAD_HOLD_SEC      = 1.2       # seconds of silence before ending utterance
 VAD_MIN_SEC       = 0.3       # minimum utterance length to bother sending
 VAD_MAX_SEC       = 12.0      # hard cap — auto-flush at 12 seconds
+
+# #15 Local LLM fallback (Pi Zero 2W offline mode)
+# Download model:  mkdir -p ~/models
+#   wget -O ~/models/smollm2-360m-q4.gguf \
+#     https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_K_M.gguf
+LOCAL_LLM_ENABLED   = True
+LOCAL_LLM_MODEL     = str(Path.home() / "models" / "smollm2-360m-q4.gguf")
+LOCAL_LLM_CTX       = 512          # context window (keep small for speed)
+LOCAL_LLM_THREADS   = 4            # Pi Zero 2W has 4 cores
+LOCAL_LLM_MAX_TOK   = 80           # max tokens per reply
+# How many consecutive WS failures before switching to offline mode:
+OFFLINE_FAIL_THRESH = 3
 
 # Wake word settings
 # WAKE_WORD_ENABLED = True requires a model trained on the exact phrase.
@@ -118,6 +131,88 @@ playback_active = threading.Event()
 
 # Shutdown event
 shutdown_event = threading.Event()
+
+# ── #15 Local LLM (llama-cpp-python) ─────────────────────────
+# Loaded lazily on first offline fallback to avoid startup delay.
+_local_llm = None
+_local_llm_lock = threading.Lock()
+_ws_fail_count = 0   # consecutive WS connection failures
+_offline_mode  = False
+
+_LOCAL_SYSTEM = (
+    "You are Zero, a small friendly robot. Answer warmly and very briefly "
+    "(1-2 sentences max). No markdown, no lists, just natural speech."
+)
+
+# Simple canned responses used when llama.cpp is unavailable or model missing
+_OFFLINE_CANNED = [
+    "I'm offline right now, but I'm still here with you!",
+    "No internet at the moment, but I heard you! Try again in a bit.",
+    "My connection is down, but don't worry — I'll be back soon!",
+    "I'm in offline mode right now. Give me a moment to reconnect!",
+]
+_canned_idx = 0
+
+
+def _try_load_local_llm() -> bool:
+    """Try to load llama-cpp-python with the SmolLM2 model. Returns True on success."""
+    global _local_llm
+    if _local_llm is not None:
+        return True
+    if not LOCAL_LLM_ENABLED:
+        return False
+    model_path = LOCAL_LLM_MODEL
+    if not Path(model_path).exists():
+        log.warning("Local LLM: model not found at %s", model_path)
+        return False
+    try:
+        from llama_cpp import Llama  # type: ignore[import]
+        with _local_llm_lock:
+            if _local_llm is None:
+                log.info("Local LLM: loading %s …", model_path)
+                _local_llm = Llama(
+                    model_path=model_path,
+                    n_ctx=LOCAL_LLM_CTX,
+                    n_threads=LOCAL_LLM_THREADS,
+                    verbose=False,
+                )
+                log.info("Local LLM: SmolLM2-360M loaded OK")
+        return True
+    except ImportError:
+        log.warning("Local LLM: llama-cpp-python not installed (pip install llama-cpp-python)")
+        return False
+    except Exception as e:
+        log.error("Local LLM: load error: %s", e)
+        return False
+
+
+def local_llm_reply(user_text: str) -> str:
+    """Generate a response using the on-device SmolLM2 model."""
+    global _canned_idx
+    if not _try_load_local_llm() or _local_llm is None:
+        # Fallback to canned responses
+        reply = _OFFLINE_CANNED[_canned_idx % len(_OFFLINE_CANNED)]
+        _canned_idx += 1
+        return reply
+    try:
+        prompt = (
+            f"<|system|>\n{_LOCAL_SYSTEM}\n"
+            f"<|user|>\n{user_text}\n"
+            "<|assistant|>\n"
+        )
+        with _local_llm_lock:
+            out = _local_llm(
+                prompt,
+                max_tokens=LOCAL_LLM_MAX_TOK,
+                temperature=0.7,
+                stop=["<|user|>", "<|system|>", "\n\n"],
+            )
+        text = out["choices"][0]["text"].strip()
+        log.info("Local LLM reply: %r", text[:80])
+        return text or _OFFLINE_CANNED[0]
+    except Exception as e:
+        log.error("Local LLM inference error: %s", e)
+        return _OFFLINE_CANNED[0]
 
 # ─────────────────────────────────────────────────────────────
 #  THREAD 1 — UART READER
@@ -209,7 +304,10 @@ async def _ws_client_loop() -> None:
     """
     Connect to server WebSocket, relay messages both ways.
     Auto-reconnects on any error.
+    After OFFLINE_FAIL_THRESH consecutive failures, switches to offline mode
+    (local LLM on Pi). Switches back as soon as the server is reachable.
     """
+    global _ws_fail_count, _offline_mode
     while not shutdown_event.is_set():
         try:
             log.info("WebSocket connecting to %s", SERVER_WS_URL)
@@ -218,17 +316,35 @@ async def _ws_client_loop() -> None:
                 ping_interval=20,
                 ping_timeout=10,
             ) as ws:
+                if _offline_mode:
+                    _offline_mode = False
+                    _ws_fail_count = 0
+                    log.info("Back online — disabling offline mode")
+                    uart_write_q.put({"command": "happy"})
                 log.info("WebSocket connected")
+                _ws_fail_count = 0
                 await asyncio.gather(
                     _ws_sender(ws),
                     _ws_receiver(ws),
                 )
         except (ConnectionClosedError, ConnectionClosedOK):
             log.warning("WebSocket closed — reconnecting in %.1fs", WS_RECONNECT_SEC)
+            _ws_fail_count += 1
         except OSError as e:
             log.error("WebSocket connection error: %s — retry in %.1fs", e, WS_RECONNECT_SEC)
+            _ws_fail_count += 1
         except asyncio.CancelledError:
             break
+
+        # Switch to offline mode after repeated failures
+        if _ws_fail_count >= OFFLINE_FAIL_THRESH and not _offline_mode:
+            _offline_mode = True
+            log.warning("Offline mode ENABLED after %d failures — using local LLM", _ws_fail_count)
+            uart_write_q.put({"command": "sad"})
+            # Pre-load local model in background
+            threading.Thread(
+                target=_try_load_local_llm, name="LocalLLMLoad", daemon=True
+            ).start()
 
         if not shutdown_event.is_set():
             await asyncio.sleep(WS_RECONNECT_SEC)
@@ -259,6 +375,8 @@ async def _ws_receiver(ws) -> None:
 
         if msg_type == "agent_reply":
             _handle_agent_reply(msg)
+        elif msg_type == "audio_chunk":
+            _handle_audio_chunk(msg)
         else:
             log.debug("Unhandled server message type: %s", msg_type)
 
@@ -266,17 +384,21 @@ async def _ws_receiver(ws) -> None:
 def _handle_agent_reply(msg: dict) -> None:
     """
     Process an agent_reply message:
-      1. Send speak_anim command to ESP32 via UART
+      1. Send speak_anim command + text to ESP32 via UART (scrolling ticker)
       2. Decode + play base64 audio through I2S speaker
     Both run concurrently (playback in a separate thread).
     """
-    ui_cmd = msg.get("ui")
+    ui_cmd    = msg.get("ui")
     audio_b64 = msg.get("audio_b64", "")
+    text      = msg.get("text", "")
 
-    # 1. Forward UI command to ESP32
+    # 1. Forward UI command + spoken text to ESP32 (for OLED scrolling ticker)
     if ui_cmd:
-        uart_write_q.put({"command": ui_cmd})
-        log.info("Queued UART command: %s", ui_cmd)
+        uart_cmd: dict = {"command": ui_cmd}
+        if text:
+            uart_cmd["text"] = text[:60]  # OLED buffer limit
+        uart_write_q.put(uart_cmd)
+        log.info("Queued UART command: %s text=%r", ui_cmd, text[:40] if text else "")
 
     # 2. Decode and play audio (non-blocking)
     if audio_b64:
@@ -291,6 +413,34 @@ def _handle_agent_reply(msg: dict) -> None:
             playback_thread.start()
         except Exception as e:
             log.error("Audio decode failed: %s", e)
+
+
+def _handle_audio_chunk(msg: dict) -> None:
+    """
+    Process a streaming audio_chunk message (sentence-by-sentence TTS).
+    Sends speak_anim + sentence text to ESP32, plays audio chunk.
+    """
+    audio_b64 = msg.get("audio_b64", "")
+    text      = msg.get("text", "")
+
+    # Send spoken sentence to ESP32 for OLED scrolling ticker
+    if text:
+        uart_write_q.put({"command": "speak_anim", "text": text[:60]})
+        log.info("Chunk UART text: %r", text[:40])
+
+    # Play audio chunk
+    if audio_b64:
+        try:
+            audio_bytes = base64.b64decode(audio_b64)
+            playback_thread = threading.Thread(
+                target=_play_wav_bytes,
+                args=(audio_bytes,),
+                name="AudioPlayback",
+                daemon=True,
+            )
+            playback_thread.start()
+        except Exception as e:
+            log.error("Chunk audio decode failed: %s", e)
 
 
 def _play_wav_bytes(wav_bytes: bytes) -> None:
@@ -531,7 +681,8 @@ def audio_capture_thread(loop: asyncio.AbstractEventLoop) -> None:
 def _flush_audio(pcm_chunks: list[np.ndarray], loop: asyncio.AbstractEventLoop) -> None:
     """
     Convert captured PCM float32 → 16-bit WAV → base64.
-    Package with current ESP32 context and enqueue for WebSocket send.
+    If online: package and enqueue for WebSocket send.
+    If offline (#15): run local LLM inference and play TTS via espeak/piper.
     """
     log.info("VAD: flushing utterance (%d chunks)", len(pcm_chunks))
     try:
@@ -539,20 +690,29 @@ def _flush_audio(pcm_chunks: list[np.ndarray], loop: asyncio.AbstractEventLoop) 
         pcm = np.concatenate(pcm_chunks, axis=0)
         # INMP441 outputs on Ch1 (left) only — extract mono from stereo capture
         if pcm.ndim == 2 and pcm.shape[1] == 2:
-            pcm = pcm[:, 0]  # take left channel
+            pcm = pcm[:, 0]
         pcm_int16 = (pcm * 32767).astype(np.int16)
 
         # Encode as WAV in memory (always mono to server)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)            # 16-bit
+            wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(pcm_int16.tobytes())
         wav_bytes = buf.getvalue()
 
-        audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+        # ── #15 Offline mode: use local STT + LLM + TTS ──────
+        if _offline_mode:
+            threading.Thread(
+                target=_offline_respond,
+                args=(wav_bytes,),
+                name="OfflineRespond",
+                daemon=True,
+            ).start()
+            return
 
+        audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
         with context_lock:
             ctx_snapshot = dict(current_context)
 
@@ -562,12 +722,64 @@ def _flush_audio(pcm_chunks: list[np.ndarray], loop: asyncio.AbstractEventLoop) 
             "context":    ctx_snapshot,
         }
 
-        # Thread-safe enqueue into the async queue
         asyncio.run_coroutine_threadsafe(ws_send_q.put(payload), loop)
         log.info("Audio payload enqueued (%d bytes WAV)", len(wav_bytes))
 
     except Exception as e:
         log.error("Audio flush error: %s", e)
+
+
+def _offline_respond(wav_bytes: bytes) -> None:
+    """
+    #15 Offline fallback pipeline:
+      WAV → Whisper tiny (local) → SmolLM2 → espeak TTS → speaker
+    Runs entirely on the Pi with no network.
+    """
+    import io as _io, wave as _wave, tempfile as _tmp, os as _os
+
+    log.info("Offline pipeline: transcribing…")
+    # ── STT: try faster-whisper if available ─────────────────
+    user_text = ""
+    try:
+        from faster_whisper import WhisperModel
+        with _tmp.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(wav_bytes)
+            tmp = f.name
+        model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(tmp, language="en", beam_size=1)
+        user_text = " ".join(s.text.strip() for s in segments).strip()
+        _os.unlink(tmp)
+        log.info("Offline STT: %r", user_text[:60])
+    except Exception as e:
+        log.warning("Offline STT failed: %s — using canned response", e)
+
+    if not user_text:
+        user_text = "hey"
+
+    # ── LLM: SmolLM2 local ───────────────────────────────────
+    reply = local_llm_reply(user_text)
+    log.info("Offline reply: %r", reply)
+
+    uart_write_q.put({"command": "speak_anim", "text": reply[:60]})
+
+    # ── TTS: espeak (always available on Pi OS) ───────────────
+    playback_active.set()
+    try:
+        result = subprocess.run(
+            ["espeak", "-v", "en", "-s", "150", "-p", "60", reply],
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            log.warning("espeak error: %s", result.stderr.decode(errors="replace")[:100])
+    except FileNotFoundError:
+        # espeak not installed — use aplay with a silent wav
+        log.warning("espeak not found — no audio for offline reply")
+    except Exception as e:
+        log.error("Offline TTS error: %s", e)
+    finally:
+        time.sleep(0.3)
+        playback_active.clear()
 
 
 # ─────────────────────────────────────────────────────────────

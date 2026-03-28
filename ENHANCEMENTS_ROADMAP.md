@@ -31,6 +31,15 @@ Robot name: **Zero**
 | I | **Persistent memory** — JSON per device-IP; stores name + personal facts across sessions | ✅ Done |
 | J | **Custom personality** — Zero: warm, cute, positive, professional, concise (≤3 sentences) | ✅ Done |
 
+## Implemented (v3.0 — AI + dashboard sprint)
+
+| # | Enhancement | Status |
+|---|-------------|--------|
+| K | **Ultra-realistic OLED eyes v6** — anatomical eyelids (per-column droop), eyebrow hair texture, pupil dilation animation, micro-saccades, emotion flash labels, scrolling text ticker | ✅ Done |
+| 13 | **Emotion from voice** — WAV pitch/energy/ZCR analysis; Zero mirrors user mood in LLM tone + OLED expression | ✅ Done |
+| 15 | **Local LLM fallback** — SmolLM2-360M-Instruct Q4 via llama-cpp-python; auto-activates after 3 WS failures; espeak TTS offline | ✅ Done |
+| 20 | **Live web dashboard** — `GET /dashboard` — real-time SSE feed: conversation bubbles, animated emotion bars, waveform, session stats | ✅ Done |
+
 ---
 
 ## Priority Backlog (Next Wave)
@@ -48,15 +57,15 @@ Robot name: **Zero**
 |---|-------------|--------|--------|
 | 11 | **Custom wake word** — Train a "hey zero" model using openWakeWord training pipeline; replace hey_jarvis placeholder | High | High |
 | 12 | **On-device STT** — Run Whisper tiny fully on Pi Zero 2W (no VPS round-trip for STT) — ~1.5s latency savings | High | High |
-| 13 | **Emotion from voice** — Detect user's emotion from audio (pitch, energy) and mirror it in expressions | Medium | Medium |
+| 13 | **Emotion from voice** — ✅ Done (server v6) |  |  |
 | 14 | **Face tracking** — Add Pi Camera + MediaPipe; eyes follow the human face in view | High | High |
-| 15 | **Local LLM fallback** — When VPS unreachable, run llama.cpp (Phi-3 mini) on Pi for offline responses | Medium | High |
+| 15 | **Local LLM fallback** — ✅ Done (SmolLM2-360M Q4, pi_main.py v2) |  |  |
 
 ### Server / VPS
 | # | Enhancement | Impact | Effort |
 |---|-------------|--------|--------|
 | 19 | **Multi-language** — Detect language from audio and respond in same language (Spanish, Hindi, etc.) | Medium | Medium |
-| 20 | **Web dashboard** — Live view: current conversation, emotion graph, IMU data, audio waveform | Medium | Medium |
+| 20 | **Web dashboard** — ✅ Done (`/dashboard` + SSE `/events` endpoint, server v6) |  |  |
 
 ---
 
@@ -93,9 +102,11 @@ Robot name: **Zero**
                                 └──────────────────┘
 ```
 
-## Server v5 Capabilities
+## Server v6 Capabilities
 - `GET /health` — status + feature flags
 - `GET /status` — same
 - `GET /toggle` — toggle response on/off
 - `GET /memory/{ip}` — inspect remembered facts for a device
-- `WS  /ws` — main pipeline: `user_input` → `audio_chunk` stream
+- `GET /dashboard` — **live web dashboard** (conversation + emotion + waveform)
+- `GET /events` — SSE stream for dashboard (conversation, emotion, mute, client-count events)
+- `WS  /ws` — main pipeline: `user_input` → `audio_chunk` stream + voice emotion detection

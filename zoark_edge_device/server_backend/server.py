@@ -45,7 +45,23 @@ app.add_middleware(
 )
 
 # ── Global toggle ─────────────────────────────────────────────
-response_enabled: bool = True
+_MUTE_STATE_FILE = Path("/opt/zoark-edge-server/mute_state.json")
+
+def _load_mute_state() -> bool:
+    try:
+        if _MUTE_STATE_FILE.exists():
+            return json.loads(_MUTE_STATE_FILE.read_text()).get("muted", False)
+    except Exception:
+        pass
+    return False
+
+def _save_mute_state(muted: bool) -> None:
+    try:
+        _MUTE_STATE_FILE.write_text(json.dumps({"muted": muted}))
+    except Exception:
+        pass
+
+response_enabled: bool = not _load_mute_state()
 
 # ── NVIDIA async client ───────────────────────────────────────
 NVIDIA_API_KEY  = "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"
@@ -168,28 +184,27 @@ _UNCERTAIN_RE = re.compile(
     r"i can.t confirm|i.m unable to confirm)\b",
     re.IGNORECASE,
 )
-# Mute: explicit phrases always fire; short ambiguous words only if utterance <= 4 words
-_VOICE_OFF_EXPLICIT = re.compile(
-    r"(be quiet|shut up|go quiet|go to sleep|sleep mode|stop talking|"
-    r"stop (responding|listening)|take a break|shush|shh+|"
-    r"zero[\s,]+(stop|be quiet|shut up|go quiet|go to sleep|sleep|mute|silence|quiet))",
+# Mute trigger: explicit always fires; short ambiguous on <=4 word utterances
+_VOICE_OFF_RE = re.compile(
+    r"(?:be quiet|shut up|go quiet|go to sleep|sleep mode|stop talking|"
+    r"stop (?:responding|listening)|take a break|shush|shh+|"
+    r"zero[\s,]+(?:stop|be quiet|shut up|go quiet|go to sleep|sleep|mute|silence|quiet))",
     re.IGNORECASE,
 )
-_VOICE_OFF_SHORT = re.compile(   # only fires when transcript is <= 4 words
-    r"(stop|pause|quiet|mute|silence|sleep)",
+_VOICE_OFF_SHORT_RE = re.compile(
+    r"(?:stop|pause|quiet|mute|silence|sleep)",
     re.IGNORECASE,
 )
-# Unmute: "wake up", "wakeup", "zero wakeup", "zero wake up", "hey zero", etc.
+# Unmute trigger
 _VOICE_ON_RE = re.compile(
-    r"(wake\s*up|wakeup|start (talking|responding|listening)|come back|"
-    r"unmute|talk (again|to me)|respond( again)?|"
+    r"(?:wake up|wakeup|start talking|start listening|come back|"
+    r"unmute|talk (?:again|to me)|respond again|"
     r"i need you|hey zero|"
-    r"zero[\s,]+(respond|listen|wake\s*up|wakeup|start|come back)|"
-    r"you can (talk|speak|respond) (now|again)|turn on)",
+    r"zero[\s,]+(?:respond|listen|wake up|wakeup|start|come back)|"
+    r"you can (?:talk|speak|respond) (?:now|again)|turn on)",
     re.IGNORECASE,
 )
 
-# ── Emotion patterns ──────────────────────────────────────────
 _ANGRY_RE = re.compile(
     r"\b(angry|furious|mad|outraged|annoyed|frustrated|no way|"
     r"stop|ridiculous|nonsense|ugh|unbelievable)\b", re.IGNORECASE)
@@ -215,9 +230,9 @@ def check_voice_toggle(text: str) -> Optional[str]:
     - When muted: Zero still transcribes to catch wake phrases (listening mode).
     """
     t = text.strip()
-    if _VOICE_OFF_EXPLICIT.search(t):
+    if _VOICE_OFF_RE.search(t):
         return "off"
-    if len(t.split()) <= 4 and _VOICE_OFF_SHORT.search(t):
+    if len(t.split()) <= 4 and _VOICE_OFF_SHORT_RE.search(t):
         return "off"
     if _VOICE_ON_RE.search(t):
         return "on"
@@ -496,6 +511,7 @@ async def stream_reply(
 async def toggle_response() -> JSONResponse:
     global response_enabled
     response_enabled = not response_enabled
+    _save_mute_state(not response_enabled)
     state = "ON" if response_enabled else "OFF"
     log.info("Response toggled: %s", state)
     return JSONResponse({"response_enabled": response_enabled, "state": state})
@@ -563,13 +579,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if not user_text:
                 log.info("STT empty — skipping")
                 continue
+            # Whisper sometimes transcribes "zero" as digit "0" — normalise it
+            user_text = re.sub(r"0", "zero", user_text)
             log.info("User said: %r", user_text)
 
             # ── Voice toggle ──────────────────────────────────
+            # ── Voice toggle ──────────────────────────────────
             voice_cmd = check_voice_toggle(user_text)
+            log.info("Toggle: cmd=%r enabled=%r", voice_cmd, response_enabled)
             if voice_cmd == "off" and response_enabled:
                 response_enabled = False
-                reply = "Okay, Zero is going quiet! Just say wake up whenever you need me!"
+                _save_mute_state(True)
+                log.info("MUTED: Zero going quiet")
+                reply = "Okay, going quiet! Just say wake up whenever you need me!"
                 wav   = await tts_sentence(reply)
                 await websocket.send_json({
                     "type": "audio_chunk",
@@ -580,7 +602,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
             elif voice_cmd == "on" and not response_enabled:
                 response_enabled = True
-                reply = "Zero is back! So happy to talk to you again! What's on your mind?"
+                _save_mute_state(False)
+                log.info("UNMUTED: Zero waking up")
+                reply = "Zero is back! So happy to talk to you again!"
                 wav   = await tts_sentence(reply)
                 await websocket.send_json({
                     "type": "audio_chunk",
@@ -591,8 +615,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             if not response_enabled:
-                log.info("Muted — ignoring: %r", user_text[:40])
+                log.info("SILENT (muted) — ignoring: %r", user_text[:50])
                 continue
+
 
             # ── Extract and store personal facts (async, non-blocking) ─
             asyncio.create_task(_update_memory(client_ip, user_text))

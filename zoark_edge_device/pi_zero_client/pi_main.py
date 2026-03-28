@@ -130,8 +130,16 @@ ws_send_q: asyncio.Queue  # initialised in main
 # UART write queue (thread-safe, non-async)
 uart_write_q: queue.Queue = queue.Queue(maxsize=8)
 
+# Sequential audio playback queue — all chunks go here, one thread drains it
+# This prevents multiple aplay processes racing and playback_active getting stuck
+audio_play_q: queue.Queue = queue.Queue(maxsize=32)
+
 # Suppresses VAD while speaker is playing (prevents feedback loop)
 playback_active = threading.Event()
+
+# Watchdog: timestamp of when playback_active was last set
+_playback_started_at: float = 0.0
+_PLAYBACK_WATCHDOG_SEC = 45.0  # force-clear if stuck longer than this
 
 # Shutdown event
 shutdown_event = threading.Event()
@@ -388,90 +396,141 @@ async def _ws_receiver(ws) -> None:
 
 def _handle_agent_reply(msg: dict) -> None:
     """
-    Process an agent_reply message:
-      1. Send speak_anim command + text to ESP32 via UART (scrolling ticker)
-      2. Decode + play base64 audio through I2S speaker
-    Both run concurrently (playback in a separate thread).
+    Process an agent_reply message.
+    Enqueues audio + UART command onto audio_play_q (sequential playback thread).
     """
     ui_cmd    = msg.get("ui")
     audio_b64 = msg.get("audio_b64", "")
     text      = msg.get("text", "")
 
-    # 1. Forward UI command + spoken text to ESP32 (for OLED scrolling ticker)
+    uart_cmd: Optional[dict] = None
     if ui_cmd:
-        uart_cmd: dict = {"command": ui_cmd}
+        uart_cmd = {"command": ui_cmd}
         if text:
-            uart_cmd["text"] = text[:60]  # OLED buffer limit
-        uart_write_q.put(uart_cmd)
-        log.info("Queued UART command: %s text=%r", ui_cmd, text[:40] if text else "")
+            uart_cmd["text"] = text[:60]
 
-    # 2. Decode and play audio (non-blocking)
     if audio_b64:
         try:
             audio_bytes = base64.b64decode(audio_b64)
-            playback_thread = threading.Thread(
-                target=_play_wav_bytes,
-                args=(audio_bytes,),
-                name="AudioPlayback",
-                daemon=True,
-            )
-            playback_thread.start()
+            audio_play_q.put({"audio": audio_bytes, "uart": uart_cmd}, block=False)
+        except queue.Full:
+            log.warning("audio_play_q full — dropping chunk")
         except Exception as e:
             log.error("Audio decode failed: %s", e)
+    elif uart_cmd:
+        audio_play_q.put({"audio": None, "uart": uart_cmd}, block=False)
 
 
 def _handle_audio_chunk(msg: dict) -> None:
     """
     Process a streaming audio_chunk message (sentence-by-sentence TTS).
-    Sends speak_anim + sentence text to ESP32, plays audio chunk.
+    Enqueues onto audio_play_q for sequential playback.
     """
     audio_b64 = msg.get("audio_b64", "")
     text      = msg.get("text", "")
+    is_last   = msg.get("is_last", False)
 
-    # Send spoken sentence to ESP32 for OLED scrolling ticker
+    uart_cmd: Optional[dict] = {"command": "speak_anim"}
     if text:
-        uart_write_q.put({"command": "speak_anim", "text": text[:60]})
+        uart_cmd["text"] = text[:60]
         log.info("Chunk UART text: %r", text[:40])
 
-    # Play audio chunk
     if audio_b64:
         try:
             audio_bytes = base64.b64decode(audio_b64)
-            playback_thread = threading.Thread(
-                target=_play_wav_bytes,
-                args=(audio_bytes,),
-                name="AudioPlayback",
-                daemon=True,
-            )
-            playback_thread.start()
+            audio_play_q.put({"audio": audio_bytes, "uart": uart_cmd, "is_last": is_last}, block=False)
+        except queue.Full:
+            log.warning("audio_play_q full — dropping chunk")
         except Exception as e:
             log.error("Chunk audio decode failed: %s", e)
+    elif is_last:
+        # Final marker with no audio — still clear the playback flag via queue
+        audio_play_q.put({"audio": None, "uart": None, "is_last": True}, block=False)
 
 
-def _play_wav_bytes(wav_bytes: bytes) -> None:
-    """Play WAV bytes through the I2S speaker via aplay (avoids pyaudio device contention)."""
-    playback_active.set()
-    try:
-        # aplay reads WAV from stdin; -q = quiet, uses default ALSA device
-        result = subprocess.run(
-            ["aplay", "-q"],
-            input=wav_bytes,
-            capture_output=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            err = result.stderr.decode(errors="replace")[:200]
-            log.error("aplay error (code %d): %s", result.returncode, err)
-        else:
-            log.info("Audio playback complete (%d bytes)", len(wav_bytes))
-    except subprocess.TimeoutExpired:
-        log.error("aplay timed out — killing")
-    except Exception as e:
-        log.error("Playback error: %s", e)
-    finally:
-        time.sleep(0.5)  # pause so mic doesn't catch speaker tail
-        playback_active.clear()
-        log.debug("Playback flag cleared — mic re-enabled")
+def audio_playback_thread() -> None:
+    """
+    Single dedicated thread that drains audio_play_q sequentially.
+    Guarantees only one aplay process runs at a time and that
+    playback_active is always cleared even if aplay crashes or hangs.
+    Also runs a watchdog to force-clear playback_active if stuck.
+    """
+    global _playback_started_at
+    log.info("Audio playback thread started")
+    _aplay_proc: Optional[subprocess.Popen] = None
+
+    while not shutdown_event.is_set():
+        # ── Watchdog: force-clear if stuck too long ───────────
+        if playback_active.is_set():
+            stuck_secs = time.monotonic() - _playback_started_at
+            if stuck_secs > _PLAYBACK_WATCHDOG_SEC:
+                log.warning("Watchdog: playback_active stuck %.0fs — force clearing", stuck_secs)
+                if _aplay_proc and _aplay_proc.poll() is None:
+                    try:
+                        _aplay_proc.kill()
+                    except Exception:
+                        pass
+                playback_active.clear()
+
+        try:
+            item = audio_play_q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        audio_bytes: Optional[bytes] = item.get("audio")
+        uart_cmd: Optional[dict]     = item.get("uart")
+
+        # Send UART command to ESP32
+        if uart_cmd:
+            try:
+                uart_write_q.put_nowait(uart_cmd)
+            except queue.Full:
+                pass
+
+        if not audio_bytes:
+            # is_last marker or uart-only item — clear flag if all chunks done
+            if audio_play_q.empty():
+                time.sleep(0.3)
+                if audio_play_q.empty():
+                    playback_active.clear()
+                    log.debug("Playback flag cleared (empty queue)")
+            continue
+
+        # ── Play audio via aplay ──────────────────────────────
+        playback_active.set()
+        _playback_started_at = time.monotonic()
+        try:
+            _aplay_proc = subprocess.Popen(
+                ["aplay", "-q"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                _, stderr = _aplay_proc.communicate(input=audio_bytes, timeout=30)
+                if _aplay_proc.returncode != 0:
+                    err = stderr.decode(errors="replace")[:200]
+                    log.error("aplay error (code %d): %s", _aplay_proc.returncode, err)
+                else:
+                    log.info("Chunk played (%d bytes)", len(audio_bytes))
+            except subprocess.TimeoutExpired:
+                log.error("aplay timed out — killing")
+                _aplay_proc.kill()
+                _aplay_proc.communicate()
+        except FileNotFoundError:
+            log.error("aplay not found — is alsa-utils installed?")
+        except Exception as e:
+            log.error("Playback error: %s", e)
+        finally:
+            _aplay_proc = None
+            # Only clear flag if nothing else is queued
+            if audio_play_q.empty():
+                time.sleep(0.4)  # brief tail silence so mic doesn't catch speaker
+                if audio_play_q.empty():
+                    playback_active.clear()
+                    log.debug("Playback flag cleared — mic re-enabled")
+
+    log.info("Audio playback thread stopped")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -767,24 +826,28 @@ def _offline_respond(wav_bytes: bytes) -> None:
 
     uart_write_q.put({"command": "speak_anim", "text": reply[:60]})
 
-    # ── TTS: espeak (always available on Pi OS) ───────────────
-    playback_active.set()
+    # ── TTS: espeak → WAV → audio_play_q ─────────────────────
     try:
+        import tempfile as _tmp2, os as _os2
+        with _tmp2.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
         result = subprocess.run(
-            ["espeak", "-v", "en", "-s", "150", "-p", "60", reply],
-            capture_output=True,
-            timeout=15,
+            ["espeak", "-v", "en", "-s", "150", "-p", "60", reply,
+             "--stdout"],
+            capture_output=True, timeout=15,
         )
-        if result.returncode != 0:
-            log.warning("espeak error: %s", result.stderr.decode(errors="replace")[:100])
+        if result.returncode == 0 and result.stdout:
+            audio_play_q.put({"audio": result.stdout, "uart": None}, block=False)
+        else:
+            log.warning("espeak failed or produced no audio")
+        try:
+            _os2.unlink(wav_path)
+        except Exception:
+            pass
     except FileNotFoundError:
-        # espeak not installed — use aplay with a silent wav
         log.warning("espeak not found — no audio for offline reply")
     except Exception as e:
         log.error("Offline TTS error: %s", e)
-    finally:
-        time.sleep(0.3)
-        playback_active.clear()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -815,9 +878,10 @@ def main() -> None:
 
     # Start threads
     threads = [
-        threading.Thread(target=uart_reader_thread,   name="UartReader",    daemon=True),
-        threading.Thread(target=ws_client_thread,     args=(ws_loop,),      name="WsClient",     daemon=True),
-        threading.Thread(target=audio_capture_thread, args=(ws_send_q_loop,), name="AudioCapture", daemon=True),
+        threading.Thread(target=uart_reader_thread,    name="UartReader",    daemon=True),
+        threading.Thread(target=ws_client_thread,      args=(ws_loop,),      name="WsClient",     daemon=True),
+        threading.Thread(target=audio_capture_thread,  args=(ws_send_q_loop,), name="AudioCapture", daemon=True),
+        threading.Thread(target=audio_playback_thread, name="AudioPlayback", daemon=True),
     ]
 
     for t in threads:
